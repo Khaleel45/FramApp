@@ -202,9 +202,20 @@ def scan_farm(farm_id: str, device_id: str, db: Session = Depends(get_db)):
             health_score = crop_analysis.ndvi_to_health_score(ndvi["current"])
             health_status = crop_analysis.ndvi_to_health_status(ndvi["current"])
         else:
-            # Weather-based health estimate
-            health_score = aggregated.get("health_score", farm.health_score)
-            health_status = aggregated.get("health_status", farm.health_status)
+            # No satellite data — estimate health from weather + risk models
+            # Start at 75 (baseline healthy) and adjust based on risks
+            base = 75
+            pest_penalty = min(30, pest.get("pest_risk_percent", 0) * 0.3)
+            disease_penalty = 15 if disease.get("disease_risk_elevated") else 0
+            water_penalty = 10 if water.get("water_stress_level") == "High" else \
+                            5 if water.get("water_stress_level") == "Moderate" else 0
+            health_score = max(30, int(base - pest_penalty - disease_penalty - water_penalty))
+            if health_score >= 70:
+                health_status = "Good (Weather-Based)"
+            elif health_score >= 50:
+                health_status = "Needs Attention (Weather-Based)"
+            else:
+                health_status = "Critical (Weather-Based)"
 
         hotspots = aggregated.get("hotspot_zones", [])
 
