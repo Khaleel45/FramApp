@@ -1,6 +1,6 @@
 """
-Satellite scan with zone-level analysis.
-Falls back gracefully when Sentinel data is unavailable (clouds, no polygon).
+Satellite scan — multi-source fusion pipeline.
+Sentinel-2 + Sentinel-1 + MODIS + Weather combined.
 """
 import traceback
 import random
@@ -16,6 +16,8 @@ from app.services.crop_risk_engine import (
     calculate_pest_risk, calculate_disease_risk, calculate_water_stress
 )
 from app.services.zone_splitter import split_into_zones, aggregate_zone_results
+from app.services.data_fusion import fuse_data_sources
+from app.services.zone_map_generator import generate_zone_map_svg
 
 router = APIRouter(prefix="/satellite", tags=["satellite"])
 
@@ -24,21 +26,22 @@ router = APIRouter(prefix="/satellite", tags=["satellite"])
 def satellite_status():
     return {
         "sentinel_configured": is_configured(),
+        "sources_available": [
+            "Sentinel-2 (NDVI/NDWI/NDMI, 10m, every 5 days)",
+            "Sentinel-1 (soil moisture/flooding, radar, every 6-12 days)",
+            "MODIS (NDVI, 250m, daily)",
+            "Open-Meteo (weather, real-time)",
+        ],
         "message": (
-            "Ready to scan farms."
+            "All sources ready."
             if is_configured()
-            else "Add SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET in Railway Variables."
+            else "Add SENTINEL_CLIENT_ID + SENTINEL_CLIENT_SECRET in Railway Variables."
         ),
     }
 
 
-def _make_bbox_polygon(lat: float, lng: float, area_acres: float) -> list:
-    """
-    Creates a bounding box polygon from a center point and area.
-    Used when farm has no drawn boundary or polygon is too small.
-    """
-    # Approximate degrees per acre at India's latitude
-    delta = (area_acres ** 0.5) * 0.003
+def _make_bbox(lat, lng, acres):
+    delta = (acres ** 0.5) * 0.003
     return [
         {"lat": lat - delta, "lng": lng - delta},
         {"lat": lat + delta, "lng": lng - delta},
@@ -47,37 +50,17 @@ def _make_bbox_polygon(lat: float, lng: float, area_acres: float) -> list:
     ]
 
 
-def _scan_with_sentinel(polygon: list, weather: dict, crop_type: str,
-                         sowing_date: str, waterlogging: str) -> dict:
-    """Attempts Sentinel scan, returns None indices if unavailable."""
-    try:
-        from app.services import sentinel_client
-        indices = sentinel_client.get_all_indices(polygon)
-        return indices
-    except Exception as e:
-        print(f"Sentinel scan error: {e}")
-        return {
-            "ndvi": {"available": False, "reason": str(e), "current": None, "previous": None},
-            "ndwi": {"available": False, "reason": str(e), "current": None, "previous": None},
-            "ndmi": {"available": False, "reason": str(e), "current": None, "previous": None},
-        }
-
-
-def _run_risk_models(ndvi_current, ndvi_previous, ndwi_current, ndwi_previous,
-                     ndmi_current, ndmi_previous, weather, crop_type,
-                     sowing_date, waterlogging):
-    """Runs all risk models with satellite or fallback values."""
-    ndvi_c = ndvi_current if ndvi_current is not None else 0.5
-    ndvi_p = ndvi_previous if ndvi_previous is not None else ndvi_c
-    ndwi_c = ndwi_current if ndwi_current is not None else -0.05
-    ndwi_p = ndwi_previous if ndwi_previous is not None else ndwi_c
-    ndmi_c = ndmi_current if ndmi_current is not None else 0.1
-    ndmi_p = ndmi_previous if ndmi_previous is not None else ndmi_c
-
+def _run_risk_models(ndvi_c, ndvi_p, ndwi_c, ndwi_p, ndmi_c, ndmi_p,
+                     weather, crop_type, sowing_date, waterlogging):
+    ndvi_c = ndvi_c or 0.5
+    ndvi_p = ndvi_p or ndvi_c
+    ndwi_c = ndwi_c or -0.05
+    ndwi_p = ndwi_p or ndwi_c
+    ndmi_c = ndmi_c or 0.1
+    ndmi_p = ndmi_p or ndmi_c
     pest = calculate_pest_risk(crop_type, sowing_date, ndvi_c, ndvi_p, weather, waterlogging)
     disease = calculate_disease_risk(crop_type, sowing_date, ndvi_c, ndvi_p, ndmi_c, ndmi_p, weather)
     water = calculate_water_stress(ndwi_c, ndwi_p, ndmi_c, weather)
-
     return pest, disease, water
 
 
@@ -88,58 +71,71 @@ def scan_farm(farm_id: str, device_id: str, db: Session = Depends(get_db)):
             detail="Sentinel Hub credentials not set in Railway Variables.")
 
     farm = db.query(Farm).filter(
-        Farm.id == farm_id, Farm.device_id == device_id
-    ).first()
+        Farm.id == farm_id, Farm.device_id == device_id).first()
     if not farm:
         raise HTTPException(status_code=404, detail="Farm not found")
 
     try:
-        # Step 1: Weather always runs — free, no credentials needed
+        # ── 1. Weather (always runs) ───────────────────────────────
         weather = get_weather_for_farm(farm.latitude, farm.longitude)
-        print(f"Weather for {farm.name}: {weather['temperature']}°C, "
-              f"{weather['humidity']}% RH, available={weather['available']}")
+        print(f"Weather: {weather['temperature']}°C, {weather['humidity']}% RH")
 
-        # Step 2: Use drawn polygon or generate bbox from center
         polygon = farm.gps_polygon
         using_bbox = False
         if not polygon or len(polygon) < 3:
-            polygon = _make_bbox_polygon(
-                farm.latitude, farm.longitude, farm.area_acres or 2.0
-            )
+            polygon = _make_bbox(farm.latitude, farm.longitude, farm.area_acres or 2.0)
             using_bbox = True
-            print(f"No polygon for {farm.name}, using center bbox")
 
-        # Step 3: Zone splitting
-        zones = split_into_zones(polygon, farm.area_acres or 2.0)
-        print(f"Split {farm.name} into {len(zones)} zones")
+        # ── 2. Sentinel-2 (optical, 10m) ──────────────────────────
+        from app.services import sentinel_client
+        s2_indices = {}
+        try:
+            s2_indices = sentinel_client.get_all_indices(polygon)
+            print(f"S2 NDVI available: {s2_indices.get('ndvi', {}).get('available')}")
+        except Exception as e:
+            print(f"S2 error: {e}")
 
-        # Step 4: Full farm Sentinel scan
-        indices = _scan_with_sentinel(
-            polygon, weather,
-            farm.crop_type or "Rice",
-            farm.sowing_date or str(datetime.utcnow().date()),
-            farm.waterlogging_severity or "None",
+        # ── 3. Sentinel-1 (radar, cloud-penetrating) ──────────────
+        s1_moisture = {}
+        try:
+            from app.services.sentinel1_client import get_soil_moisture_index
+            s1_moisture = get_soil_moisture_index(polygon)
+            print(f"S1 moisture: {s1_moisture.get('soil_moisture_level', 'unavailable')}")
+        except Exception as e:
+            print(f"S1 error: {e}")
+
+        # ── 4. MODIS (250m, daily) ─────────────────────────────────
+        modis_ndvi = {}
+        try:
+            from app.services.modis_client import get_modis_ndvi
+            modis_ndvi = get_modis_ndvi(farm.latitude, farm.longitude)
+            print(f"MODIS NDVI available: {modis_ndvi.get('available')}")
+        except Exception as e:
+            print(f"MODIS error: {e}")
+
+        # ── 5. Fuse all sources ────────────────────────────────────
+        fused = fuse_data_sources(
+            sentinel2_indices=s2_indices,
+            sentinel1_moisture=s1_moisture,
+            modis_ndvi=modis_ndvi,
+            weather=weather,
+            crop_type=farm.crop_type or "Rice",
+            sowing_date=farm.sowing_date or str(datetime.utcnow().date()),
+            farm_name=farm.name,
         )
+        print(f"Fused: score={fused['health_score']}, quality={fused['data_quality']}, sources={fused['sources_used']}")
 
-        ndvi = indices.get("ndvi", {})
-        ndwi = indices.get("ndwi", {})
-        ndmi = indices.get("ndmi", {})
-
-        sentinel_available = ndvi.get("available", False)
-        print(f"Sentinel data available: {sentinel_available}")
-
-        # Step 5: Zone-level analysis
+        # ── 6. Zone-level scanning ─────────────────────────────────
+        zones = split_into_zones(polygon, farm.area_acres or 2.0)
         zone_results = []
-        if sentinel_available and not using_bbox and len(zones) > 1:
-            # Scan each zone individually with Sentinel
-            from app.services import sentinel_client
+
+        if s2_indices.get("ndvi", {}).get("available") and not using_bbox and len(zones) > 1:
             for zone in zones:
                 try:
-                    zone_indices = sentinel_client.get_all_indices(zone["polygon"])
-                    z_ndvi = zone_indices.get("ndvi", {})
-                    z_ndwi = zone_indices.get("ndwi", {})
-                    z_ndmi = zone_indices.get("ndmi", {})
-
+                    zi = sentinel_client.get_all_indices(zone["polygon"])
+                    z_ndvi = zi.get("ndvi", {})
+                    z_ndwi = zi.get("ndwi", {})
+                    z_ndmi = zi.get("ndmi", {})
                     z_pest, z_disease, z_water = _run_risk_models(
                         z_ndvi.get("current"), z_ndvi.get("previous"),
                         z_ndwi.get("current"), z_ndwi.get("previous"),
@@ -148,98 +144,81 @@ def scan_farm(farm_id: str, device_id: str, db: Session = Depends(get_db)):
                         farm.sowing_date or str(datetime.utcnow().date()),
                         farm.waterlogging_severity or "None",
                     )
-
                     zone_results.append({
                         "zone_name": zone["name"],
                         "area_acres": zone["area_acres"],
                         "ndvi_available": z_ndvi.get("available", False),
-                        "ndvi": z_ndvi.get("current", ndvi.get("current", 0.5)),
+                        "ndvi": z_ndvi.get("current", fused["ndvi"] or 0.5),
                         "pest_risk_percent": z_pest["pest_risk_percent"],
+                        "top_pest": z_pest.get("top_pest_name", ""),
                         "disease_risk_level": z_disease["disease_risk_level"],
                         "water_stress_level": z_water["water_stress_level"],
                     })
                 except Exception as e:
                     zone_results.append({
                         "zone_name": zone["name"],
-                        "area_acres": zone["area_acres"],
+                        "area_acres": zone.get("area_acres", 2.0),
                         "ndvi_available": False,
-                        "ndvi": ndvi.get("current", 0.5),
+                        "ndvi": fused["ndvi"] or 0.5,
                         "pest_risk_percent": 0,
                         "disease_risk_level": "Low",
                         "water_stress_level": "Low",
                     })
         else:
-            # Single zone result from full farm scan
-            # (no polygon, clouds, or only 1 zone)
             zone_results = [{
                 "zone_name": "Full Farm",
                 "area_acres": farm.area_acres or 2.0,
-                "ndvi_available": sentinel_available,
-                "ndvi": ndvi.get("current", 0.5),
+                "ndvi_available": fused["ndvi"] is not None,
+                "ndvi": fused["ndvi"] or 0.5,
                 "pest_risk_percent": 0,
                 "disease_risk_level": "Low",
-                "water_stress_level": "Low",
+                "water_stress_level": fused["water_stress_level"],
             }]
 
-        # Step 6: Risk models on full farm indices
-        pest, disease, water = _run_risk_models(
-            ndvi.get("current"), ndvi.get("previous"),
-            ndwi.get("current"), ndwi.get("previous"),
-            ndmi.get("current"), ndmi.get("previous"),
-            weather, farm.crop_type or "Rice",
-            farm.sowing_date or str(datetime.utcnow().date()),
-            farm.waterlogging_severity or "None",
-        )
-
-        # Step 7: Aggregate zone results
+        # ── 7. Aggregate zones, find hotspots ─────────────────────
         aggregated = aggregate_zone_results(zone_results, farm.name)
-
-        # Step 8: Waterlogging detection
-        wl_sev, wl_note = crop_analysis.detect_waterlogging(ndwi.get("current"))
-
-        # Step 9: Build health score
-        if sentinel_available:
-            health_score = crop_analysis.ndvi_to_health_score(ndvi["current"])
-            health_status = crop_analysis.ndvi_to_health_status(ndvi["current"])
-        else:
-            # No satellite data — estimate health from weather + risk models
-            # Start at 75 (baseline healthy) and adjust based on risks
-            base = 75
-            pest_penalty = min(30, pest.get("pest_risk_percent", 0) * 0.3)
-            disease_penalty = 15 if disease.get("disease_risk_elevated") else 0
-            water_penalty = 10 if water.get("water_stress_level") == "High" else \
-                            5 if water.get("water_stress_level") == "Moderate" else 0
-            health_score = max(30, int(base - pest_penalty - disease_penalty - water_penalty))
-            if health_score >= 70:
-                health_status = "Good (Weather-Based)"
-            elif health_score >= 50:
-                health_status = "Needs Attention (Weather-Based)"
-            else:
-                health_status = "Critical (Weather-Based)"
-
         hotspots = aggregated.get("hotspot_zones", [])
 
-        # Step 10: Save to DB
-        farm.health_score = health_score
-        farm.health_status = health_status
-        farm.water_stress_level = water["water_stress_level"]
-        farm.water_stress_confidence = water["water_stress_confidence"]
-        farm.water_stress_area = water.get("water_stress_recommendation", "")
+        # ── 8. Farm-level risk models ─────────────────────────────
+        wl = "Severe" if fused["waterlogging_detected"] else farm.waterlogging_severity or "None"
+        pest, disease, water = _run_risk_models(
+            fused["ndvi"], fused.get("ndvi_previous"),
+            fused["ndwi"], fused["ndwi"],
+            fused["ndmi"], fused["ndmi"],
+            weather, farm.crop_type or "Rice",
+            farm.sowing_date or str(datetime.utcnow().date()),
+            wl,
+        )
+
+        # ── 9. Zone map SVG ───────────────────────────────────────
+        zone_map_svg = generate_zone_map_svg(
+            zones=zones,
+            zone_results=zone_results,
+            farm_name=farm.name,
+            hotspot_zones=hotspots,
+        )
+
+        # ── 10. Save to database ──────────────────────────────────
+        wl_sev, _ = crop_analysis.detect_waterlogging(fused["ndwi"])
+        if fused["waterlogging_detected"]:
+            wl_sev = "Severe"
+
+        farm.health_score = fused["health_score"]
+        farm.health_status = fused["health_status"]
+        farm.water_stress_level = fused["water_stress_level"]
+        farm.water_stress_confidence = fused["water_stress_confidence"]
         farm.waterlogging_severity = wl_sev
         farm.pest_risk_percent = pest["pest_risk_percent"]
+        farm.pest_confidence = pest["pest_risk_percent"]
         farm.pest_hotspots = [z["zone_name"] for z in hotspots] if hotspots else []
         farm.disease_risk_level = disease["disease_risk_level"]
         farm.disease_risk_elevated = disease["disease_risk_elevated"]
         farm.disease_risk_notes = (
             aggregated.get("summary") or disease["disease_risk_notes"]
         )
-        farm.last_scan_date = str(datetime.utcnow().date())
-
+        farm.last_scan_date = fused["scan_date"]
         db.commit()
         db.refresh(farm)
-
-        zone_count = len(zone_results)
-        zones_with_data = sum(1 for z in zone_results if z.get("ndvi_available"))
 
         return {
             "success": True,
@@ -253,24 +232,27 @@ def scan_farm(farm_id: str, device_id: str, db: Session = Depends(get_db)):
             "disease_risk_level": farm.disease_risk_level,
             "disease_risk_notes": farm.disease_risk_notes,
             "last_scan_date": farm.last_scan_date,
-            "ndvi": ndvi,
-            "ndwi": ndwi,
-            "sentinel_available": sentinel_available,
-            "used_bbox": using_bbox,
+            "data_sources": fused["sources_used"],
+            "data_quality": fused["data_quality"],
+            "data_quality_label": fused["data_quality_label"],
+            "confidence": fused["confidence"],
+            "sentinel_available": s2_indices.get("ndvi", {}).get("available", False),
+            "sentinel1_available": s1_moisture.get("available", False),
+            "modis_available": modis_ndvi.get("available", False),
             "zone_analysis": {
-                "zone_count": zone_count,
-                "zones_scanned": zones_with_data,
+                "zone_count": len(zone_results),
+                "zones_scanned": sum(1 for z in zone_results if z.get("ndvi_available")),
                 "hotspot_zones": hotspots,
                 "zone_alerts": aggregated.get("zone_alerts", []),
                 "summary": aggregated.get("summary", ""),
-                "ndvi_average": aggregated.get("ndvi_average"),
+                "zone_map_svg": zone_map_svg,
             },
             "weather": {
                 "temperature": weather.get("temperature"),
                 "humidity": weather.get("humidity"),
                 "rainfall_7d": weather.get("rainfall_7d"),
                 "leaf_wetness_hours": weather.get("leaf_wetness_hours"),
-                "weather_available": weather.get("available", False),
+                "available": weather.get("available", False),
             },
         }
 
@@ -283,56 +265,41 @@ def scan_farm(farm_id: str, device_id: str, db: Session = Depends(get_db)):
 
 @router.post("/scan-all")
 def scan_all_farms(device_id: str, db: Session = Depends(get_db)):
-    if not is_configured():
-        raise HTTPException(status_code=503, detail="Sentinel credentials not set.")
     farms = db.query(Farm).filter(Farm.device_id == device_id).all()
     results = []
     for farm in farms:
-        polygon = farm.gps_polygon
-        if not polygon or len(polygon) < 3:
-            polygon = _make_bbox_polygon(farm.latitude, farm.longitude, farm.area_acres or 2.0)
+        polygon = farm.gps_polygon or _make_bbox(farm.latitude, farm.longitude, farm.area_acres or 2.0)
         zones = split_into_zones(polygon, farm.area_acres or 2.0)
         results.append({"farm_id": farm.id, "name": farm.name, "zones": len(zones)})
-    return {"scanned": len(results), "results": results}
+    return {"farms": len(results), "results": results}
 
 
 @router.post("/test-scan/{farm_id}")
 def test_scan(farm_id: str, device_id: str, db: Session = Depends(get_db)):
-    """Test with fake satellite + real weather + real zone splitting."""
     farm = db.query(Farm).filter(
-        Farm.id == farm_id, Farm.device_id == device_id
-    ).first()
+        Farm.id == farm_id, Farm.device_id == device_id).first()
     if not farm:
         raise HTTPException(status_code=404, detail="Farm not found")
 
     weather = get_weather_for_farm(farm.latitude, farm.longitude)
-
-    polygon = farm.gps_polygon
-    if not polygon or len(polygon) < 3:
-        polygon = _make_bbox_polygon(farm.latitude, farm.longitude, farm.area_acres or 2.0)
-
-    zones = split_into_zones(polygon, farm.area_acres or 2.0)
-    if not zones:
-        zones = [{"name": "Full Farm", "area_acres": farm.area_acres or 2.0}]
+    polygon = farm.gps_polygon or _make_bbox(farm.latitude, farm.longitude, farm.area_acres or 2.0)
+    zones = split_into_zones(polygon, farm.area_acres or 2.0) or [
+        {"name": "Full Farm", "area_acres": farm.area_acres or 2.0, "row": 0, "col": 0}]
 
     base_ndvi = round(random.uniform(0.45, 0.72), 3)
-    stressed_zones = random.sample(range(len(zones)), k=max(1, len(zones) // 4))
-
+    stressed_idx = random.sample(range(len(zones)), k=max(1, len(zones) // 4))
     zone_results = []
+
     for i, zone in enumerate(zones):
-        ndvi = round(base_ndvi - random.uniform(0.15, 0.28), 3) if i in stressed_zones \
+        ndvi = round(base_ndvi - random.uniform(0.15, 0.28), 3) if i in stressed_idx \
                else round(base_ndvi + random.uniform(-0.05, 0.08), 3)
         ndvi = max(0.1, min(0.9, ndvi))
-        ndvi_prev = round(ndvi + random.uniform(0.02, 0.10), 3)
         ndwi = round(random.uniform(-0.15, 0.10), 3)
         ndmi = round(random.uniform(0.05, 0.25), 3)
-
         pest, disease, water = _run_risk_models(
-            ndvi, ndvi_prev, ndwi, ndwi - 0.03, ndmi, ndmi + 0.05,
+            ndvi, ndvi + 0.06, ndwi, ndwi - 0.03, ndmi, ndmi + 0.05,
             weather, farm.crop_type or "Rice",
-            farm.sowing_date or str(datetime.utcnow().date()),
-            "None",
-        )
+            farm.sowing_date or str(datetime.utcnow().date()), "None")
         zone_results.append({
             "zone_name": zone["name"],
             "area_acres": zone.get("area_acres", 2.0),
@@ -346,8 +313,9 @@ def test_scan(farm_id: str, device_id: str, db: Session = Depends(get_db)):
 
     aggregated = aggregate_zone_results(zone_results, farm.name)
     hotspots = aggregated.get("hotspot_zones", [])
-    max_pest = max(zone_results, key=lambda z: z.get("pest_risk_percent", 0))
+    zone_map_svg = generate_zone_map_svg(zones, zone_results, farm.name, hotspots)
 
+    max_pest = max(zone_results, key=lambda z: z.get("pest_risk_percent", 0))
     farm.health_score = aggregated.get("health_score", 70)
     farm.health_status = aggregated.get("health_status", "Good")
     farm.pest_risk_percent = max_pest.get("pest_risk_percent", 0)
@@ -360,23 +328,26 @@ def test_scan(farm_id: str, device_id: str, db: Session = Depends(get_db)):
     db.refresh(farm)
 
     return {
-        "success": True,
-        "test": True,
-        "farm_id": farm.id,
-        "farm_name": farm.name,
+        "success": True, "test": True,
+        "farm_id": farm.id, "farm_name": farm.name,
         "health_score": farm.health_score,
         "health_status": farm.health_status,
         "pest_risk_percent": farm.pest_risk_percent,
         "disease_risk_level": farm.disease_risk_level,
         "disease_risk_notes": farm.disease_risk_notes,
         "last_scan_date": farm.last_scan_date,
+        "data_sources": ["Weather (test)", "Synthetic NDVI"],
+        "data_quality": "test",
+        "data_quality_label": "Synthetic test data — not real satellite",
+        "confidence": 70,
         "zone_analysis": {
-            "zone_count": len(zone_results),
+            "zone_count": len(zones),
             "zones_scanned": len(zone_results),
             "hotspot_zones": hotspots,
             "zone_alerts": aggregated.get("zone_alerts", []),
             "summary": aggregated.get("summary", ""),
+            "zone_map_svg": zone_map_svg,
         },
         "weather": weather,
-        "note": f"Fake satellite, real weather + crop risk. Farm split into {len(zones)} zones.",
+        "note": f"Synthetic data. Farm split into {len(zones)} zones.",
     }
